@@ -1,4 +1,4 @@
-# Nextcloud VM (nextcloud-vm) — Appliance Runbook
+# Nextcloud on Proxmox LXC — HA Build & Operations Runbook
 
 > **🌐 PUBLIC / SANITISED VERSION**
 > Hostnames, IPs, MACs and identifiers replaced with placeholders (`example.com`, RFC 1918 / documentation values). No secrets appear in this document. Substitute your own values throughout.
@@ -6,390 +6,437 @@
 | | |
 |---|---|
 | **Maintainer** | Richard Carragher (RC COMMS) |
-| **Last updated** | 10 June 2026 |
-| **Document version** | 1.0 |
-| **Guest** | VM 111 `nextcloud-vm` on node `pve` (Proxmox VE) |
-| **Appliance** | TurnKey Nextcloud 18.1 (Debian 12 bookworm), provisioned via community-scripts ProxmoxVE helper |
-| **Nextcloud** | Hub 26 Spring (34.0.0) |
-| **Stack** | Apache 2.4 · PHP 8.3.31 · MariaDB 10.11.14 · Redis (unix socket) |
+| **Last updated** | 9 October 2026 |
+| **Document version** | 2.0 (supersedes the v1.0 TurnKey VM runbook) |
+| **Platform** | Proxmox VE 9.2 three-node cluster, ZFS on every node |
+| **Guests** | 3 × unprivileged Debian 13 (trixie) LXC + 1 stateless tunnel connector |
+| **Nextcloud** | Hub 26 Spring (35.0.1) |
+| **Stack** | nginx · PHP-FPM 8.4 · MariaDB 11.8 · Redis (unix socket) · APCu |
+| **Exposure** | Cloudflare Tunnel only — no inbound ports |
 | **Classification** | Public |
 
 ---
 
 ## Related documents
 
-- **`proxmox-infrastructure-PUBLIC.md`** — cluster master documentation — VM placement, storage, networking context.
-- **`eurooffice-nextcloud-PUBLIC.md`** — Euro-Office DocumentServer (CT 141) integration: reverse proxy, JWT, connector. This VM hosts the Apache layer that fronts both services.
+- **`proxmox-infrastructure-PUBLIC.md`** — cluster master documentation: nodes, storage, networking.
+- **`eurooffice-nextcloud-PUBLIC.md`** — Euro-Office DocumentServer integration (JWT, connector). *Note: its reverse-proxy section describes the retired VM; the document server is now published directly through the tunnel (§3.6 below).*
+- **`nextcloud-tunnel-hardening-PUBLIC.md`** — Cloudflare Tunnel and edge hardening background.
 
 ## Table of contents
 
 1. [Overview](#1-overview)
-2. [VM specification](#2-vm-specification)
-3. [Guest stack](#3-guest-stack)
-4. [Web layer: Apache, TLS, DNS](#4-web-layer-apache-tls-dns)
-5. [Nextcloud configuration](#5-nextcloud-configuration)
-6. [Apps inventory](#6-apps-inventory)
-7. [Operational runbook](#7-operational-runbook)
-8. [Security posture](#8-security-posture)
-9. [Troubleshooting](#9-troubleshooting)
-10. [Known quirks](#10-known-quirks)
-11. [Explain like I'm 5](#11-explain-like-im-5)
-12. [References](#12-references)
-13. [Appendices](#13-appendices)
+2. [Architecture](#2-architecture)
+3. [Build reference](#3-build-reference)
+4. [Migrating from the TurnKey VM](#4-migrating-from-the-turnkey-vm)
+5. [Data protection](#5-data-protection)
+6. [Routine operations](#6-routine-operations)
+7. [Failover and failback](#7-failover-and-failback)
+8. [Verification checklist](#8-verification-checklist)
+9. [Known issues and gotchas](#9-known-issues-and-gotchas)
+10. [Explain like I'm 5](#10-explain-like-im-5)
+11. [References](#11-references)
+12. [Change log](#12-change-log)
 
 ---
 
 ## 1. Overview
 
-VM 111 (`nextcloud-vm`) is the family cloud: file sync/share, photos, calendars/contacts (DAV), and — since June 2026 — collaborative office editing via the Euro-Office connector to CT 141. It is the **only** guest exposed to the internet: the consumer router forwards WAN 80/443 to 10.0.0.40, where Apache terminates TLS for two public hostnames and reverse-proxies one of them to the document server LXC.
+The family cloud (files, calendars/contacts, photos, collaborative office editing) was rebuilt in October 2026 from a single TurnKey appliance VM into **one-service-per-container LXCs** on a three-node Proxmox cluster:
 
-### Why a VM rather than an LXC?
+- **App** and **database** containers, replicated every five minutes to a second node and managed by Proxmox HA.
+- **Two Cloudflare Tunnel connectors** on different nodes, so the public endpoint survives the loss of a node.
+- **No inbound ports** on the router. LAN clients use the same Cloudflare path as everyone else (no split DNS).
+- Existing desktop, mobile and CalDAV/CardDAV clients carried on **without reconfiguration** — same hostname, same instance ID and secrets, database migrated intact.
 
-The Nextcloud deployment is a self-contained appliance image (TurnKey) bundling its own OS, webserver, database and configuration console — the classic case for KVM over LXC on this cluster (see cluster doc §1). The community-scripts ProxmoxVE "Nextcloud VM" helper was used for provisioning; under the hood it deploys the TurnKey Nextcloud appliance, which is why the guest identifies as `turnkey-nextcloud-18.1-bookworm-amd64` while the VM carries the `community-script` tag.
+### Why move off the appliance VM?
+
+| Problem with the VM | Fix in the LXC design |
+|---|---|
+| Data on the OS root disk, which kept filling | Dedicated ZFS data volume, grows online |
+| Appliance OS (TurnKey) with no supported in-place Debian upgrade | Stock Debian 13: PHP 8.4 and MariaDB 11.8 native, no third-party repos |
+| VM disk on non-replicable local LVM | ZFS volumes, replicated with `pvesr` |
+| Single node, single point of failure | HA restart on a second node + a second tunnel connector |
+| Router port-forward 80/443 to the VM | Cloudflare Tunnel only |
 
 ---
 
-## 2. VM specification
+## 2. Architecture
 
-From `qm config 111` (10 June 2026):
-
-| Property | Value |
-|---|---|
-| VMID / name | 111 / `nextcloud-vm` |
-| Node | pve |
-| Machine / BIOS | q35 / SeaBIOS (+ 4 MB `efidisk0` present but SeaBIOS boots `scsi0` directly) |
-| vCPU / RAM | 2 cores / 4096 MB |
-| `scsi0` | `local-lvm:vm-111-disk-1`, 40 GB, discard=on, ssd=1 |
-| `scsi1` | `local-lvm:vm-111-disk-2`, 828 MB, discard=on, ssd=1 |
-| SCSI HW | virtio-scsi-pci |
-| NIC | virtio, MAC `<MAC>`, bridge `vmbr0` |
-| IP | 10.0.0.40/24 (DHCP — **reservation required**, see cluster doc backlog) |
-| QEMU guest agent | enabled (gives clean shutdowns and fsfreeze-consistent snapshot backups) |
-| Onboot | yes — `startup order=4, up=60` |
-| Latest snapshot | `Update_20260610_160603` (BassT23 updater pre-update) |
-| UUID / VMGENID | `<UUID>` / `<VMGENID>` |
-| Tags | `community-script` |
-
-### Guest filesystem
-
-| | |
-|---|---|
-| Root | `/dev/mapper/turnkey-root` (LVM), 36 GB — 13 GB used (38%) |
-| Nextcloud data | `/var/www/nextcloud-data` — **on the root filesystem** |
-| Nextcloud code | `/var/www/nextcloud` |
-
-> **Capacity note:** user data shares the 36 GB root volume. At 38% with light family use this is fine, but photo libraries grow fast. The escape paths, in order of preference: grow `scsi0` + LVM + filesystem online; or add a dedicated virtual disk for `/var/www/nextcloud-data`; or external storage (`files_external` is already enabled) against the NAS (CT 101). Decide before, not after, it fills.
-
----
-
-## 3. Guest stack
-
-| Layer | Detail |
-|---|---|
-| OS | Debian 12 (bookworm), TurnKey 18.1 build |
-| Web | Apache 2.4 (`mpm_prefork` per TurnKey default), TLS on :443, redirect vhost on :80 |
-| PHP | 8.3.31 NTS (CLI + Apache module) |
-| DB | MariaDB 10.11.14, db `nextcloud`, user `nextcloud`, prefix `oc_`, utf8mb4 |
-| Cache/locking | Redis via unix socket `/var/run/redis/redis.sock` — both `memcache.local` and `memcache.locking`; `filelocking.enabled = true` |
-| Background jobs | **cron mode** — `www-data` crontab runs `php -f /var/www/nextcloud/cron.php` every 5 minutes |
-| Mail | SMTP via <SMTP_HOST>:465 (SSL, auth `<SMTP_USER>`), from `<MAIL_FROM>`, TLS peer verification on |
-| Management consoles | Webmin `https://10.0.0.40:12321` **enabled (LAN-only — never forward)**; shellinabox :12320 **disabled** |
-| No `sudo` | TurnKey ships without it — see Quirk 1 / the `occ` wrapper (Appendix B) |
-
----
-
-## 4. Web layer: Apache, TLS, DNS
-
-### 4.1 DNS (Cloudflare zone `example.com`)
-
-| Record | Type | Value | Proxy |
+| Component | Guest | Placeholder IP | Node |
 |---|---|---|---|
-| `nextcloud` | A | <WAN_IP> | DNS only |
-| `office` | A | <WAN_IP> | DNS only |
+| App — nginx, PHP-FPM, Redis, APCu, cron | CT `nc-app` | 10.0.0.48 | node B (HA) |
+| Database — MariaDB | CT `nc-db` | 10.0.0.49 | node B (HA) |
+| Tunnel connector #1 | CT `cf-connector-1` | 10.0.0.12 | node B (HA) |
+| Tunnel connector #2 | CT `cf-connector-2` | 10.0.0.18 | node C (pinned, stateless) |
+| Document server (Euro-Office) | CT `docserver` | 10.0.0.41 | node B |
+| File backend (Samba NAS) | CT `nas` | 10.0.0.32 | node A |
 
-Grey-cloud deliberately (Cloudflare proxy's 100 MB upload cap breaks large syncs). Residential WAN IP — DDNS updater on the cluster doc backlog.
+```
+Client ─HTTPS─► Cloudflare edge (TLS, WAF) ─tunnel─► cf-connector-1 / cf-connector-2
+       ─HTTP:80─► nc-app nginx ─► php-fpm ─► nc-db :3306
+                                     ├─► Redis (unix socket)
+                                     ├─► SMB shares on nas (External Storage)
+                                     └─► docserver (internal URL)
+docserver ─HTTP:80─► nc-app (StorageUrl: file fetch / save callbacks)
+```
 
-### 4.2 Virtual hosts
+Public hostnames: `cloud.example.com` (Nextcloud) and `office.example.com` (document server).
 
-| File | Hostname | Role |
-|---|---|---|
-| `/etc/apache2/sites-available/nextcloud.conf` | `cloud.example.com` (+ default for bare-IP requests) | Serves Nextcloud from `/var/www/nextcloud`; port-80 vhost 301-redirects to HTTPS **and must remain — dehydrated's HTTP-01 renewals depend on it**; HSTS `max-age=15552000; includeSubDomains` |
-| `/etc/apache2/sites-available/office.conf` | `office.example.com` | TLS-terminating reverse proxy (HTTP + WebSocket) → CT 141 nginx :80. Full file in the eurooffice runbook, Appendix A |
+---
 
-Enabled modules beyond TurnKey defaults: `proxy proxy_http proxy_wstunnel rewrite headers`.
+## 3. Build reference
 
-### 4.3 Certificates — two mechanisms, both on this VM
+Common to every guest:
+- Template: `debian-13-standard`.
+- Settings: `unprivileged 1`, `nesting=1`, storage on a ZFS pool **with the same storage ID on every node** (needed for replication), static IP, and Pi-hole DNS.
+- Management: SSH disabled (`systemctl disable --now ssh.socket ssh.service`); manage with `pct enter` / `pct exec`.
 
-| Hostname | Challenge / client | Cert location | Renewal |
+### 3.1 Containers
+
+| CT | Cores / RAM / swap | rootfs | Extra volume |
 |---|---|---|---|
-| `nextcloud.…` | HTTP-01 / TurnKey confconsole (dehydrated) | `/etc/ssl/private/cert.pem` — referenced **globally** in `/etc/apache2/mods-available/ssl.conf`; the nextcloud vhost inherits it (no per-vhost cert directives) | `/etc/cron.daily/confconsole-dehydrated`; Let's Encrypt (issuer E8 at time of writing), ~90-day cycle |
-| `office.…` | DNS-01 / certbot + `python3-certbot-dns-cloudflare` | `/etc/letsencrypt/live/office.example.com/` — per-vhost directives in `office.conf` override the global default | `certbot.timer`; deploy hook reloads Apache; Cloudflare token (zone-scoped) in `/root/.secrets/cloudflare.ini` (0600) |
-
-Health checks: `openssl x509 -in /etc/ssl/private/cert.pem -noout -dates -issuer` and `certbot renew --dry-run` — both **on this VM** (running the dry-run on CT 141 reports "no renewals", as nothing lives there).
-
----
-
-## 5. Nextcloud configuration
-
-Non-secret `config.php` state as documented 10 June 2026 (secrets — `secret`, `passwordsalt`, DB and SMTP passwords, `updater.secret` — live only in `config.php` and the password manager):
-
-| Key | Value | Note |
-|---|---|---|
-| `version` | 34.0.0.12 | Hub 26 Spring |
-| `trusted_domains` | `localhost`, `10.0.0.40`, `10.0.0.150`, `cloud.example.com` | `.150` entry — identify or remove (backlog) |
-| `datadirectory` | `/var/www/nextcloud-data` | on root FS — see §2 capacity note |
-| `overwrite.cli.url` | `https://cloud.example.com` | fixed 10 Jun 2026 (was `http://localhost`) |
-| `default_phone_region` | `GB` | set 10 Jun 2026 |
-| `log_rotate_size` | 104857600 (100 MB) | set 10 Jun 2026 |
-| `memcache.local` / `memcache.locking` | Redis (unix socket) | |
-| `loglevel` / `logfile` | 3 / `/var/www/nextcloud-data/nextcloud.log` | |
-| `maintenance_window_start` | 1 (01:00 UTC) | heavy background jobs window |
-| `mysql.utf8mb4` | true | |
-| Mail | SMTP SSL :465, the mail provider, verified peer | |
-| `config_preset` | 2 | TurnKey preset |
-
-Connector app config (`eurooffice`): `DocumentServerUrl = https://office.example.com/`, `DocumentServerInternalUrl = http://10.0.0.41/`, `StorageUrl = https://cloud.example.com/`, `jwt_secret = <in password manager>`.
-
----
-
-## 6. Apps inventory
-
-Enabled third-party / notable apps as of 10 June 2026 (full `occ app:list` output is the authoritative record — re-run after changes):
-
-| App | Version | Purpose |
-|---|---|---|
-| `eurooffice` | 11.0.0 | Euro-Office DocumentServer connector ("Nextcloud Office" in the store) |
-| `office` | 1.0.0 | Office-suite selector (distinct from the connector — see eurooffice runbook Quirk 5) |
-| `twofactor_totp` / `twofactor_webauthn` / `twofactor_backupcodes` / `twofactor_nextcloud_notification` | 16.0.0 / 2.7.0 / 1.23.0 / 8.0.0 | 2FA methods |
-| `suspicious_login` | 12.0.0-dev.0 | ML-based login anomaly detection |
-| `bruteforcesettings` | 7.0.0 | Brute-force protection tuning |
-| `admin_audit` | 1.24.0 | Audit logging |
-| `files_external` | 1.26.0 | External storage (currently unused — candidate for NAS-backed data growth) |
-| `integration_onedrive` | 3.5.1 | OneDrive import |
-| `guests` | 4.7.5 | Restricted guest accounts |
-| `circles` / `files_lock` / `files_reminders` / `files_downloadlimit` | 34.0.0 / 34.0.0 / 1.7.0 / 5.2.0 | Collaboration extras |
-| `photos` | 7.0.0 | Photo management |
-| `text` | 8.0.0 | Markdown/text editor (non-Office formats) |
-| Core: `activity`, `dav`, `files_*`, `theming`, `notifications`, `serverinfo`, `updatenotification`, etc. | — | Stock Hub 26 set |
-
-Family-sharing plan (from the eurooffice runbook §10): `family` group + **Group folders** app (not yet installed — backlog) for a shared "Family Documents" folder.
-
----
-
-## 7. Operational runbook
-
-### 7.1 occ usage
-
-Always via the wrapper (`/usr/local/bin/occ`, Appendix B) or `su -s /bin/sh www-data -c "php /var/www/nextcloud/occ …"`. **`sudo` does not exist on this box.**
-
-### 7.2 Updating Nextcloud (minor/point releases)
+| `nc-app` | 4 / 4 GiB / 1 GiB | 16 GB | `mp0` 150 GB → `/var/www/nextcloud-data`, `backup=0`, ZFS `recordsize=1M` |
+| `nc-db` | 2 / 2 GiB / 512 MiB | 12 GB | `mp0` 20 GB → `/var/lib/mysql`, ZFS `recordsize=16K` |
+| connectors | 1 / 256 MiB / 256 MiB | 4 GB | — |
 
 ```bash
-qm snapshot 111 pre-nc-update-$(date +%Y%m%d)        # on pve
+pct create <ID> local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst \
+  --hostname nc-db --unprivileged 1 --ostype debian \
+  --cores 2 --memory 2048 --swap 512 \
+  --rootfs <zfs-storage>:12 \
+  --mp0 <zfs-storage>:20,mp=/var/lib/mysql \
+  --net0 name=eth0,bridge=vmbr0,ip=10.0.0.49/24,gw=10.0.0.1 \
+  --features nesting=1 --onboot 1
+zfs set recordsize=16K <pool>/subvol-<ID>-disk-1     # before any data is written
+```
+
+Use **Proxmox-managed mount points**, not host bind mounts. Managed volumes replicate, migrate and snapshot with the container, and unprivileged UID mapping is handled for you.
+
+### 3.2 Database container
+
+`/etc/mysql/mariadb.conf.d/60-nextcloud.cnf`:
+
+```ini
+[mysqld]
+bind_address            = 10.0.0.49
+skip_name_resolve       = ON
+transaction_isolation   = READ-COMMITTED
+character_set_server    = utf8mb4
+collation_server        = utf8mb4_general_ci
+innodb_buffer_pool_size = 768M
+max_connections         = 100
+tmp_table_size          = 64M
+max_heap_table_size     = 64M
+innodb_log_file_size    = 256M
+innodb_doublewrite      = 0      # only safe because the data volume uses recordsize=16K on ZFS
+innodb_flush_neighbors  = 0
+slow_query_log          = ON
+slow_query_log_file     = /var/log/mysql/mariadb-slow.log
+long_query_time         = 2
+```
+
+- **Database and user:** database `nextcloud` (utf8mb4). User `nextcloud@10.0.0.48` only, with privileges on `nextcloud.*`.
+- **Password handling:** generate the password inside the container straight into a root-only `[client]` file. That way it never appears on screen or in shell history.
+- **Proxmox firewall** (`/etc/pve/firewall/<ID>.fw`): allow 3306/tcp from the app container only, plus LAN ICMP. Set `policy_in: DROP` and `firewall=1` on the NIC.
+
+### 3.3 App container
+
+Packages, all from the trixie repos:
+
+```bash
+apt install -y nginx redis-server php-fpm php-cli php-mysql php-gd php-curl php-mbstring \
+  php-intl php-xml php-zip php-bcmath php-gmp php-bz2 php-apcu php-redis php-imagick \
+  libmagickcore-7.q16-10-extra php-smbclient ffmpeg mariadb-client unzip
+```
+
+> If any External Storage mounts are SMB, **`php-smbclient` is mandatory**. Appliances often bundle it silently. Without it, every SMB mount shows 0 KB.
+
+**Redis on a socket only.** Set `port 0` in `/etc/redis/redis.conf` and append:
+```
+unixsocket /run/redis/redis-server.sock
+unixsocketperm 770
+```
+Then run `usermod -aG redis www-data`.
+
+**PHP**, in `/etc/php/8.4/fpm/conf.d/90-nextcloud.ini` (copy the same file into `cli/conf.d/`):
+
+```ini
+memory_limit = 1G
+upload_max_filesize = 16G
+post_max_size = 16G
+max_execution_time = 3600
+max_input_time = 3600
+output_buffering = 0
+date.timezone = Europe/London
+opcache.enable = 1
+opcache.memory_consumption = 256
+opcache.interned_strings_buffer = 32
+opcache.max_accelerated_files = 20000
+opcache.revalidate_freq = 60
+opcache.save_comments = 1
+apc.enable_cli = 1
+```
+
+**Dedicated FPM pool**, in `/etc/php/8.4/fpm/pool.d/nextcloud.conf`. Rename the stock `www.conf` so it no longer loads.
+
+```ini
+[nextcloud]
+user = www-data
+group = www-data
+listen = /run/php/php8.4-fpm-nextcloud.sock
+listen.owner = www-data
+listen.group = www-data
+listen.mode = 0660
+pm = dynamic
+pm.max_children = 24
+pm.start_servers = 6
+pm.min_spare_servers = 6
+pm.max_spare_servers = 12
+pm.max_requests = 500
+request_terminate_timeout = 300
+env[HOSTNAME] = $HOSTNAME
+env[PATH] = /usr/local/bin:/usr/bin:/bin
+env[TMP] = /tmp
+env[TMPDIR] = /tmp
+env[TEMP] = /tmp
+```
+
+**nginx.** Use the [Nextcloud Admin Manual reference vhost](https://docs.nextcloud.com/server/latest/admin_manual/installation/nginx.html) with these site-specific changes:
+
+```nginx
+upstream php-handler { server unix:/run/php/php8.4-fpm-nextcloud.sock; }
+server {
+    listen 10.0.0.48:80;                 # specific address, never 0.0.0.0
+    server_name cloud.example.com;
+    root /var/www/nextcloud;
+    set_real_ip_from 10.0.0.12;          # every tunnel connector
+    set_real_ip_from 10.0.0.18;
+    real_ip_header   CF-Connecting-IP;
+    client_max_body_size 16G;
+    # … reference config …
+    # inside the PHP location:  fastcgi_param HTTPS on;
+}
+```
+
+Because nginx binds to a specific IP, make it wait for the network. Otherwise a reboot can leave it failed with a 502. Create `/etc/systemd/system/nginx.service.d/10-network-online.conf`:
+
+```ini
+[Unit]
+Wants=network-online.target
+After=network-online.target
+```
+
+**Background jobs.** Use a systemd timer, as the Admin Manual's *Background jobs* page describes:
+- `nextcloudcron.service`: `User=www-data`, `ExecCondition=php -f /var/www/nextcloud/occ status -e`, `ExecStart=/usr/bin/php -f /var/www/nextcloud/cron.php`.
+- `nextcloudcron.timer`: `OnUnitActiveSec=5min`.
+
+Then run `occ background:cron`.
+
+**`occ` wrapper.** Create `/usr/local/bin/occ` containing:
+```sh
+#!/bin/sh
+exec runuser -u www-data -- php /var/www/nextcloud/occ "$@"
+```
+`pct enter` gives a reduced `PATH`, so add `/usr/local/bin` to root's `.bashrc`.
+
+**Proxmox firewall.** Allow 80/tcp from the tunnel connectors and the document server only, plus LAN ICMP, with `policy_in: DROP`.
+
+### 3.4 `config.php` essentials
+
+| Key | Value |
+|---|---|
+| `datadirectory` | Keep the **same path** as the old server (§4) |
+| `instanceid`, `passwordsalt`, `secret` | Carried over — **never regenerate**. They encrypt stored external-storage credentials, sessions and app passwords |
+| `dbhost` | `10.0.0.49` |
+| `memcache.local` | `\OC\Memcache\APCu` |
+| `memcache.distributed`, `memcache.locking` | `\OC\Memcache\Redis` |
+| `redis` | `host` = socket path, `port` 0 |
+| `trusted_domains` | `localhost`, app IP, `cloud.example.com` |
+| `trusted_proxies` | every connector IP |
+| `forwarded_for_headers` | `HTTP_CF_CONNECTING_IP` |
+| `overwriteprotocol` | `https` (the origin is plain HTTP behind the tunnel) |
+| `allow_local_remote_servers` | `true` if the document server is on the LAN |
+
+Document-server connector settings:
+- the **public** document-server URL
+- an **internal** URL (`http://10.0.0.41/`)
+- a **StorageUrl** of `http://10.0.0.48/`, so the document server reaches Nextcloud directly on the LAN
+- **thumbnails off** (§9)
+
+### 3.5 Tunnel connectors
+
+1. Install `cloudflared` from Cloudflare's apt repository.
+2. Create the service user **before** the token directory:
+
+```bash
+useradd --system --no-create-home --shell /usr/sbin/nologin cloudflared
+install -d -m 750 -o root -g cloudflared /etc/cloudflared
+# token file: /etc/cloudflared/<tunnel>.token, mode 640 root:cloudflared — piped in, never echoed
+```
+
+3. Write the systemd unit, `cloudflared-<tunnel>.service`:
+
+```ini
+[Service]
+Type=notify
+User=cloudflared
+Group=cloudflared
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel run --token-file /etc/cloudflared/<tunnel>.token
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+```
+
+To verify, run `journalctl -u cloudflared-<tunnel> | grep "Registered tunnel connection"`; you should see 4 lines. Recent versions print a long pre-check banner, so grep rather than `tail`.
+
+Run **two connectors with the same token on different nodes**. Cloudflare balances between them and keeps serving through a node failure.
+
+**Every connector IP must be trusted in three places before the connector starts:**
+- the app container's firewall
+- nginx `set_real_ip_from`
+- Nextcloud `trusted_proxies`
+
+### 3.6 Cloudflare
+
+- **Routes:** add published-application routes pointing at **LAN IPs**: `cloud.example.com` → `http://10.0.0.48:80` and `office.example.com` → `http://10.0.0.41:80`. Never use `localhost`: each connector resolves it to its own container.
+- **WAF custom rules (free plan):**
+  - Block `*.php` paths except `/index.php`, `/remote.php`, `/public.php`, `/status.php`, `/ocs/v1.php` and `/ocs/v2.php`.
+  - Block common scanner paths (`/wp-`, `/.env`, `/.git`, `/cgi-bin`, `/phpmyadmin`).
+  - Managed challenge for browser logins (`/login`, `/index.php/login`, `/login/v2/flow*`) from outside your home countries.
+- **Rate limit:** login form POSTs, 5 per 10 seconds per IP.
+- **Never challenge client API paths** (`/remote.php`, `/ocs`, `/status.php`, `/.well-known`, `/login/v2/poll`). Sync clients cannot solve challenges.
+- **Keep Bot Fight Mode off.** On the free plan it is zone-wide and breaks Nextcloud, DAV, password-manager and photo-app clients.
+- The web updater is blocked by the `.php` rule. That is deliberate: upgrade with `occ` only.
+
+---
+
+## 4. Migrating from the TurnKey VM
+
+Rough timings: about 20 minutes of downtime for about 42 GB of data, plus a 400k-row file cache.
+
+1. **Build** the new containers. Install the **exact same Nextcloud version** as the old server, after checking the SHA-256 and GPG signature. Do not run the installer.
+2. **Copy third-party apps** byte-for-byte from the old `apps/` directory, using a `tar` pipe.
+3. **Mount the data volume at the old data path.** Nextcloud records that path in the database (`oc_storages`, `local::/path/`). Changing it orphans file IDs, shares and app data.
+4. **Pre-seed the data** while the old server is live: `rsync -aH --numeric-ids --chown=100033:100033 old:/data/ /<pool>/subvol-<ID>-disk-1/`.
+5. **Copy `config.php`** and change only the database, cache, proxy and trusted-domain keys (§3.4).
+6. **Cut over:**
+   1. Turn on maintenance mode on the old server.
+   2. Pipe `mariadb-dump --single-transaction --routines --triggers` into the new database, and compare table and `oc_filecache` row counts.
+   3. Run a final `rsync --delete`.
+   4. Run `occ upgrade` (it should report nothing to do) and `occ maintenance:data-fingerprint`.
+7. **Repoint** the document server's StorageUrl, and remove any hosts-file pins.
+8. **Switch** the tunnel routes to the new LAN IPs.
+9. **Check local DNS** for overrides of the public hostname: Pi-hole Local DNS records **and** `misc.dnsmasq_lines` `local=/host/` entries.
+10. **Retire** the old VM: stop its connector, set `onboot 0`, shut it down, and keep it with a snapshot for two weeks.
+
+---
+
+## 5. Data protection
+
+| Layer | What | Schedule |
+|---|---|---|
+| Storage replication (`pvesr`) | app + DB containers to a second node over the storage network | every 5 min (connector every 15) |
+| Proxmox HA | app, DB, connector #1; node-affinity across two nodes + positive resource-affinity keeping app and DB together | continuous |
+| vzdump | container root filesystems and the DB volume (data volume excluded) | weekly |
+| Logical DB dump | `mariadb-dump --single-transaction` → zstd, 7 days local | nightly, before restic |
+| restic → off-site storage box | data volume (previews excluded) + dump directory, own snapshot group/tag | nightly |
+
+**Restore the database only:**
+```bash
 occ maintenance:mode --on
-# Web updater (Settings → Administration → Overview) or:
-su -s /bin/sh www-data -c "php /var/www/nextcloud/updater/updater.phar"
-occ upgrade
-occ maintenance:mode --off
-occ db:add-missing-indices && occ db:add-missing-columns
-# verify: occ status ; Settings → Overview warnings ; open a document (exercises eurooffice)
+zstd -dc nextcloud-<TS>.sql.zst | pct exec <db-ID> -- mariadb nextcloud
+occ maintenance:mode --off && occ maintenance:data-fingerprint
 ```
 
-Major version jumps: read the NC release notes first; the `eurooffice` connector supports NC 33–35 — check connector compatibility **before** any jump beyond 35.
-
-### 7.3 OS patching
-
-Covered by the monthly **BassT23 Proxmox Updater** run (cluster doc §7), which snapshots first (hence `Update_*` snapshot names). Manual: `apt update && apt upgrade` — TurnKey tracks Debian bookworm security.
-
-### 7.4 Backups
-
-- **Current:** manual vzdump to `node1_backup` (directory storage on `tank`, pve).
-- **Target state (set up June 2026):** scheduled job, weekly, **snapshot mode** (guest agent gives fsfreeze consistency — MariaDB/Redis state is crash-consistent and Nextcloud tolerates this well), retention instead of keep-all:
-
+**Restore files:**
+```bash
+restic restore <snapshot> --target /restore --include <data-path>/<user>/files/<path>
+# copy back as 100033:100033, then:
+occ files:scan --path="<user>/files/<path>"
 ```
-# Datacenter → Backup → Add  (or /etc/pve/jobs.cfg)
-vzdump: backup-weekly-cloud
-        schedule sun 02:30
-        storage node1_backup
-        vmid 111,141
-        mode snapshot
-        compress zstd
-        prune-backups keep-last=4,keep-weekly=4,keep-monthly=3
-        notes-template {{guestname}} weekly
-        enabled 1
-```
-
-- 02:30 sits after Nextcloud's 01:00 maintenance window. For belt-and-braces application-level consistency, an optional pre/post hook can toggle `occ maintenance:mode` — usually unnecessary with the agent.
-- **Restore drill (quarterly, per cluster backup runbook):** restore to a spare VMID (`qmrestore … --unique`), boot isolated, verify login + file access, destroy.
-- Off-site: this VM is the highest-value guest — it should be first in line when the cluster off-site gap (backup runbook §gap analysis) is closed.
-
-### 7.5 Scheduled checks
-
-| Cadence | Check |
-|---|---|
-| Weekly | Settings → Administration → Overview — zero warnings |
-| Weekly | `df -h /` — root FS trend (§2 capacity note) |
-| Monthly | `certbot renew --dry-run` + dehydrated cert expiry (§4.3) |
-| Monthly | `occ app:update --all` (review, then apply) |
-| Monthly | Verify cron heartbeat: Settings → Basic settings → background jobs "Last job execution" < 10 min |
-| Quarterly | scan.nextcloud.com; external port scan (only 80/443 on <WAN_IP>); restore drill |
-
-### 7.6 Logs
-
-| What | Where |
-|---|---|
-| Nextcloud app log | `/var/www/nextcloud-data/nextcloud.log` (loglevel 3, rotates at 100 MB) — or `occ log:tail` |
-| Apache | `/var/log/apache2/{access,error}.log` |
-| Audit | `admin_audit` app → log |
-| ACME | `/var/log/letsencrypt/`; dehydrated via daily cron output |
 
 ---
 
-## 8. Security posture
+## 6. Routine operations
 
-1. **Exposure:** only 80/443 forwarded at the router, to this VM alone; 80 is redirect-only. Webmin :12321 LAN-only (verify it is excluded from any forward); shellinabox :12320 disabled.
-2. **TLS:** HSTS with includeSubDomains on both vhosts; Let's Encrypt on both names; no TLS 1.0/1.1 (TurnKey default ssl.conf).
-3. **Auth:** 2FA apps installed (TOTP, WebAuthn, backup codes) — **enforce for admin at minimum** (Settings → Security); `suspicious_login` and brute-force protection active; `password_policy` enabled.
-4. **App-layer:** `admin_audit` logging; server-side encryption **not** enabled (deliberate — key management risk outweighs benefit for a LAN-hosted box with disk-level trust).
-5. **Secrets hygiene:** config.php is 0640 www-data; SMTP credentials rotated 10 Jun 2026 after exposure during the build session; JWT + secure_link + Cloudflare token in password manager only.
-6. **External validation:** scan.nextcloud.com run 10 Jun 2026 (record rating in Appendix D on receipt); SSL Labs A-grade target.
-7. **Open question (backlog):** identify `10.0.0.150` in trusted_domains — remove if stale.
+| Task | How |
+|---|---|
+| Upgrade Nextcloud | Snapshot app + DB → maintenance on → CLI updater (`updater.phar` as www-data) → `occ upgrade` → `occ db:add-missing-indices` → maintenance off |
+| Upgrade apps | `occ app:update --all` |
+| PHP updates | `systemctl reload php8.4-fpm` afterwards |
+| Pool health | `tail /var/log/php8.4-fpm.log`. Any `max_children` warning means saturation (§9) |
+| Grow storage | `pct resize <ID> mp0 +50G` (online) |
+| Replication | `pvesr status` |
 
 ---
 
-## 9. Troubleshooting
+## 7. Failover and failback
 
-| Symptom | Likely cause | Fix |
+- **Node failure:** HA fences the failed node and starts the app, DB and connector #1 on the second node from the last replica. You lose at most 5 minutes of changes, and there are about 2–3 minutes of 502s. Connector #2 keeps the tunnel up throughout.
+- **After a failover:**
+  1. Run `occ status` and `occ files:scan --all` (the DB and files can be up to one replication interval apart), then `occ maintenance:repair`.
+  2. Expect node-scoped backup jobs to skip the moved guests. Run a manual vzdump if the outage is long.
+- **Failback** (in a planned window): `ha-manager crm-command relocate` the DB, then the app (the together rule keeps them paired), then the connector.
+
+---
+
+## 8. Verification checklist
+
+- [ ] `https://cloud.example.com/status.php` returns `"maintenance":false`
+- [ ] Connectors and the document server get `200` from the app container. Anything else is blocked by the firewall.
+- [ ] Web login works; images show previews; SMB folders show real sizes
+- [ ] Desktop client syncs and uploads; the mobile app refreshes; CalDAV/CardDAV refresh
+- [ ] An office document opens, edits and saves, and a new version appears
+- [ ] A public share link opens in a private window
+- [ ] *Administration → Overview* shows no warnings
+- [ ] The tunnel shows 2 healthy replicas
+
+---
+
+## 9. Known issues and gotchas
+
+| Symptom | Cause | Fix |
 |---|---|---|
-| "Document security token…" / editor errors | CT 141 side — JWT (`default.json` quirk) | eurooffice runbook §9 + `jwttest.py` |
-| 502 opening documents | docservice booting/down on CT 141 | `pct enter 141` → healthcheck, logs |
-| App store install fails (cURL timeout to GitHub) | IPv6 with no route (Quirk 2) | `wget -4` manual install; gai.conf already set |
-| Background jobs stale | www-data crontab missing / PHP error | `crontab -u www-data -l`; run cron.php manually and read output |
-| Web UI slow / locks | Redis socket perms or service down | `systemctl status redis`; `redis-cli -s /var/run/redis/redis.sock ping` |
-| "Trusted domain" error on access | accessing via an IP/hostname not in trusted_domains | `occ config:system:get trusted_domains`; add if legitimate |
-| Cert expired on nextcloud vhost | dehydrated cron failed silently | run `/usr/lib/confconsole/plugins.d/Lets_Encrypt/dehydrated-wrapper` manually; check port-80 vhost intact |
-| occ: "sudo: not found" | TurnKey has no sudo | wrapper / `su -s /bin/sh www-data -c` |
+| 504 Gateway Timeout; FPM log shows `reached pm.max_children` | Document-server **thumbnails**: each preview holds a PHP worker while the document server downloads the file via StorageUrl, which needs *another* worker. A folder full of office files exhausts the pool. | Turn off the connector's preview option; size the pool at 24 with `request_terminate_timeout`; in an emergency, restart php-fpm |
+| SMB folders show 0 KB | `php-smbclient` missing | Install it and restart php-fpm |
+| "Resharing is not allowed" | `enable_sharing` disabled on that External Storage mount | Expected by policy, or enable it per mount |
+| 502 after the app container reboots | nginx started before its IP existed | `network-online` override |
+| Intermittent 502s with two connectors | Route points at `localhost` | Use LAN IPs |
+| LAN gets NXDOMAIN while external works | Leftover Pi-hole `local=/host/` dnsmasq line | Remove it from `misc.dnsmasq_lines` on every Pi-hole |
+| `cloudflared` "permission denied" on the token | Directory created under `umask 077` | `750 root:cloudflared` on the directory |
+| Positive resource-affinity rule rejected (PVE 9) | Not allowed together with a node-affinity rule that uses different priorities | Give the nodes equal weight |
+| `preview:cleanup` removed the whole preview folder | Behaviour in Nextcloud 35 | Harmless. Previews regenerate; expect a CPU burst |
 
 ---
 
-## 10. Known quirks
+## 10. Explain like I'm 5
 
-1. **No `sudo`** — TurnKey convention; all occ docs/snippets online assume `sudo -u www-data`. Use the wrapper (Appendix B).
-2. **IPv6 enabled, no route** — broke ACME and app-store fetches. Fixed system-wide with `precedence ::ffff:0:0/96 100` in `/etc/gai.conf`; PHP paths can still misbehave, so manual app installs use `wget -4`. Full IPv6 disable via sysctl remains an option.
-3. **Global certificate wiring** — the nextcloud vhost has no cert directives; it inherits `/etc/ssl/private/cert.pem` from `mods-available/ssl.conf`. Any new vhost needing a *different* cert must carry per-vhost directives (as `office.conf` does). Easy to miss when adding sites.
-4. **Appliance lineage** — `community-script` tag on the VM but TurnKey inside; documentation for *both* applies (TurnKey for confconsole/dehydrated/Webmin, community-scripts only for provisioning).
-5. **`efidisk0` present but BIOS is SeaBIOS** — harmless leftover from the provisioning script; the 4 MB EFI disk is unused. Don't "fix" it; changing BIOS type on an installed guest breaks boot.
-6. **`scsi1` 828 MB disk** — provisioning artefact (TurnKey install medium); currently attached and in the boot order after scsi0. Candidate for detachment after verifying nothing mounts it (`lsblk` in guest) — backlog.
+The old setup was one big toy box that did everything and sat by the front door. The new setup is three small boxes:
+- one that shows you your toys (the app)
+- one that remembers where every toy is (the database)
+- one that answers the door (the tunnel)
 
----
-
-## 11. Explain like I'm 5
-
-This VM is the family's toy box *and* the front door of the house. Every visitor from the internet knocks on one door (port 443); the doorman (Apache) checks the name on the envelope and either opens the toy box (Nextcloud) or walks them down the hall to the craft table room (the Euro-Office LXC). The doorman renews his two door-badges (certificates) by himself — one by hanging a note on the door (HTTP-01), one by whispering to the phone book company (DNS-01). A little robot (cron) tidies the toy box every five minutes, and every night at half two on Sundays a photographer (vzdump) takes a picture of the whole room so we can rebuild it exactly if anything breaks.
+Every five minutes, a helper copies the first two boxes into a second room. If the first room's lights go out, the boxes are carried next door and opened again. There are two doormen in two different rooms, so somebody always answers. Nobody can walk straight in from the street: every visitor first checks in at the Cloudflare reception desk.
 
 ---
 
-## 12. References
+## 11. References
 
-1. TurnKey Nextcloud appliance: https://www.turnkeylinux.org/nextcloud
-2. community-scripts ProxmoxVE (provisioning helper): https://community-scripts.github.io/ProxmoxVE/
-3. Nextcloud 34 admin manual: https://docs.nextcloud.com/server/34/admin_manual/
-4. Nextcloud occ reference: https://docs.nextcloud.com/server/34/admin_manual/occ_command.html
-5. Nextcloud server tuning (Redis, cron, opcache): https://docs.nextcloud.com/server/34/admin_manual/installation/server_tuning.html
-6. certbot dns-cloudflare: https://certbot-dns-cloudflare.readthedocs.io/
-7. Proxmox vzdump / backup jobs: https://pve.proxmox.com/wiki/Backup_and_Restore
-8. Companion documents: `proxmox-infrastructure-PUBLIC.md`, `eurooffice-nextcloud-PUBLIC.md`
+1. Nextcloud Admin Manual — [NGINX configuration](https://docs.nextcloud.com/server/latest/admin_manual/installation/nginx.html), [Server tuning](https://docs.nextcloud.com/server/latest/admin_manual/installation/server_tuning.html), [Background jobs](https://docs.nextcloud.com/server/latest/admin_manual/configuration_server/background_jobs_configuration.html), [Reverse proxy](https://docs.nextcloud.com/server/latest/admin_manual/configuration_server/reverse_proxy_configuration.html), [Migrating to a different server](https://docs.nextcloud.com/server/latest/admin_manual/maintenance/migrating.html)
+2. Proxmox VE Admin Guide — [Container storage](https://pve.proxmox.com/wiki/Linux_Container), [Storage Replication](https://pve.proxmox.com/wiki/Storage_Replication), [High Availability](https://pve.proxmox.com/wiki/High_Availability), [Firewall](https://pve.proxmox.com/wiki/Firewall)
+3. OpenZFS — [Workload tuning: MySQL/InnoDB](https://openzfs.github.io/openzfs-docs/Performance%20and%20Tuning/Workload%20Tuning.html)
+4. Cloudflare — [Tunnel replicas](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/deploy-tunnels/tunnel-availability/), [WAF custom rules](https://developers.cloudflare.com/waf/custom-rules/), [Rate limiting rules](https://developers.cloudflare.com/waf/rate-limiting-rules/)
 
 ---
 
-## 13. Appendices
-
-### Appendix A — `/etc/apache2/sites-available/nextcloud.conf` (as deployed, 10 June 2026)
-
-```apache
-ServerName localhost
-
-<VirtualHost *:80>
-    UseCanonicalName Off
-    ServerAdmin webmaster@localhost
-    RewriteEngine On
-    RewriteRule ^(.*)$ https://%{HTTP_HOST}%{REQUEST_URI} [L,R=301]
-</VirtualHost>
-
-<VirtualHost *:443>
-    ServerName cloud.example.com
-    SSLEngine on
-    ServerAdmin webmaster@localhost
-    DocumentRoot /var/www/nextcloud/
-    <IfModule mod_headers.c>
-        Header always set Strict-Transport-Security "max-age=15552000; includeSubDomains"
-    </IfModule>
-</VirtualHost>
-
-<Directory /var/www/nextcloud/>
-    Options +FollowSymLinks
-    AllowOverride All
-    Require all granted
-</Directory>
-```
-
-(The port-80 vhost is load-bearing for dehydrated HTTP-01 renewals. `office.conf` is documented in the eurooffice runbook.)
-
-### Appendix B — `/usr/local/bin/occ` wrapper
-
-```bash
-#!/bin/bash
-cd /var/www/nextcloud
-exec su -s /bin/sh www-data -c "/usr/bin/php occ $(printf '%q ' "$@")"
-```
-
-### Appendix C — Quick reference
-
-```bash
-occ status                                   # version / maintenance state
-occ maintenance:mode --on|--off
-occ config:system:get trusted_domains
-occ app:list --enabled
-occ log:tail
-occ user:list ; occ group:list
-occ files:scan --all                         # after any out-of-band file changes
-occ db:add-missing-indices
-qm snapshot 111 <name>      # on pve, before any risky change
-qm agent 111 ping           # guest agent health
-```
-
-### Appendix D — Change log
+## 12. Change log
 
 | Date | Version | Change |
 |---|---|---|
-| 10 Jun 2026 | 1.0 | Initial runbook. Captured post-EuroOffice-integration state: NC 34.0.0 on TurnKey 18.1; office.conf reverse-proxy vhost + DNS-01 cert added; eurooffice 11.0.0 connector configured; config.php hygiene (cli.url, phone region, log rotation); SMTP credentials rotated; gai.conf IPv4 preference applied. scan.nextcloud.com run — rating to be recorded. |
+| 10 Jun 2026 | 1.0 | TurnKey Nextcloud VM runbook (Apache, router port-forward, Let's Encrypt on the VM) |
+| 9 Oct 2026 | 2.0 | Rebuilt as HA LXCs on Debian 13 / PHP 8.4 / MariaDB 11.8; Cloudflare Tunnel with two connectors; per-guest firewalls; replication + HA; DB dump + restic off-site; WAF rules; PHP-FPM saturation fix; VM retired |
 
-### Appendix E — Outstanding items / improvement backlog
-
-| Priority | Item | Notes |
-|---|---|---|
-| High | **DHCP reservation for .40** | Load-bearing IP (public vhosts, CT 141 hosts pin) — pin in the router |
-| High | **Activate the scheduled vzdump job** | §7.4 — replaces manual backups; includes CT 141 |
-| High | **Enforce 2FA for admin** | Apps installed; enforcement not yet confirmed |
-| Medium | **Identify/remove `10.0.0.150`** from trusted_domains | Unknown entry |
-| Medium | **Install Group folders + create `family` group** | Family sharing plan (eurooffice runbook §10) |
-| Medium | **Data-growth plan** | Root FS at 38%; pick: grow scsi0 / dedicated data disk / files_external → NAS |
-| Low | **Detach `scsi1` (828 MB)** | After `lsblk` confirms unused |
-| Low | **Record scan.nextcloud.com rating** | Appendix D |
-
-### Appendix F — Glossary
-
-| Term | Meaning |
-|---|---|
-| **TurnKey appliance** | Pre-built Debian-based VM image with the application stack and a config console (confconsole) baked in |
-| **confconsole / dehydrated** | TurnKey's configuration console and its ACME (Let's Encrypt) client |
-| **occ** | Nextcloud's command-line administration tool (ownCloud Console, historically) |
-| **cron mode** | Background-job strategy where system cron invokes `cron.php` — preferred over AJAX/webcron |
-| **trusted_domains** | Hostnames/IPs Nextcloud will accept requests for — anti-host-header-injection |
-| **HTTP-01 / DNS-01** | ACME challenge types: file on port 80 vs DNS TXT record |
-| **fsfreeze** | Guest-agent filesystem quiesce during snapshot backups — gives crash-consistent images |
-| **vzdump snapshot mode** | Backup of a running guest from a point-in-time snapshot — no downtime |
-
----
-
-*End of document (v1.0, 10 June 2026). Store this version in your password manager / encrypted vault. Update after every change to the VM and keep aligned with the sanitised public counterpart.*
+*End of document (v2.0, 9 October 2026). Keep aligned with the INTERNAL counterpart.*
